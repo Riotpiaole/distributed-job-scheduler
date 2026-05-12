@@ -6,9 +6,11 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-module example.com/my_app
+module riotpiaole.com/vec_db_pipeline
 
 go 1.23.0
+
+replace riotpiaole.com/vec_db_pipeline => ../slogger
 
 require github.com/spf13/cobra v1.8.1
 

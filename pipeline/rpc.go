@@ -8,15 +8,15 @@ import (
 type MsgType int
 
 const (
-	AskForTask      MsgType = iota // `Worker`请求任务
-	MapTaskAlloc                   // `Coordinator`分配`Map`任务
-	ReduceTaskAlloc                // `Coordinator`分配`Reduce`任务
-	MapSuccess                     // `Worker`报告`Map`任务的执行成功
-	MapFailed                      // `Worker`报告`Map`任务的执行失败
-	ReduceSuccess                  // `Worker`报告`Reduce`任务的执行成功
-	ReduceFailed                   //`Worker`报告`Reduce`任务的执行失败
-	Shutdown                       // `Coordinator`告知`Worker`退出（所有任务执行成功）
-	Wait                           //`Coordinator`告知`Worker`休眠（暂时没有任务需要执行）
+	AskForTask       MsgType = iota // `Worker`请求任务
+	MapTaskAlloc                    // `Coordinator`分配`Map`任务
+	ReduceTaskAlloc                 // `Coordinator`分配`Reduce`任务
+	MapSuccess                      // `Worker`报告`Map`任务的执行成功
+	MapTaskFailed                   // `Worker`报告`Map`任务的执行失败
+	ReduceSuccess                   // `Worker`报告`Reduce`任务的执行成功
+	ReduceTaskFailed                //`Worker`报告`Reduce`任务的执行失败
+	Shutdown                        // `Coordinator`告知`Worker`退出（所有任务执行成功）
+	Wait                            //`Coordinator`告知`Worker`休眠（暂时没有任务需要执行）
 )
 
 type MicroBatchMsg struct {

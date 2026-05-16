@@ -23,7 +23,7 @@ var _ StreamListener = (*Pipeline)(nil)
 // FileDataSource handles directory ingestion
 type Pipeline struct {
 	Sources       datasource.DataSource
-	Clusters      []Coordinator
+	Actions       []StreamProcessAction
 	WindowSize    int
 	PartitionFunc func(string) string
 }
@@ -39,35 +39,42 @@ func (p *Pipeline) ListenRawBytes(source <-chan []byte) {
 }
 
 // Filter implements StreamProcess.
-func (p *Pipeline) Filter(validateFunc func(string) bool) StreamProcess {
+func (p *Pipeline) Filter(validateFunc StreamProcessAction) StreamProcess {
 	panic("unimplemented")
 }
 
 // GroupBy implements StreamProcess.
-func (p *Pipeline) GroupBy(groupFunc func(string) string) StreamProcess {
+func (p *Pipeline) GroupBy(groupFunc StreamProcessAction) StreamProcess {
 	panic("unimplemented")
 }
 
 // Map implements StreamProcess.
-func (p *Pipeline) Map(mapFunc func(string) string) StreamProcess {
+func (p *Pipeline) Map(mapFunc StreamProcessAction) StreamProcess {
 	panic("unimplemented")
 }
 
 // Reduce implements StreamProcess.
-func (p *Pipeline) Reduce(reduceFunc func(string, string) string) StreamProcess {
+func (p *Pipeline) Reduce(reduceFunc StreamProcessAction) StreamProcess {
+	panic("unimplemented")
+}
+
+// Sequential implements StreamProcess.
+func (p *Pipeline) Sequential(aggergateFunc StreamProcessAction) StreamProcess {
 	panic("unimplemented")
 }
 
 // Sink implements StreamProcess.
-func (p *Pipeline) Sink(sinkFunc func(string) error) error {
+func (p *Pipeline) Sink(sinkFunc StreamProcessAction) error {
 	panic("unimplemented")
 }
+
+// Sequential implements StreamProcess.
 
 // NewPipeline creates a new instance
 func NewPipeline(source datasource.DataSource, windowSize int, partitionFunc func(string) string) *Pipeline {
 	return &Pipeline{
 		Sources:       source,
-		Clusters:      []Coordinator{}, // This can be populated with actual cluster addresses
+		Actions:       []StreamProcessAction{}, // This can be populated with actual cluster addresses
 		WindowSize:    windowSize,
 		PartitionFunc: partitionFunc,
 	}
@@ -78,11 +85,10 @@ func (p *Pipeline) Start() {
 	ctx := context.Background()
 
 	msgCh := p.Sources.Stream(ctx)
-	coordinator := NewCoordinator()
+	coordinator := NewCoordinator(p.Actions)
 
-	coordinator.ListenFromDataSource(msgCh)
+	go coordinator.StartsServer(msgCh)
 
-	coordinator.StartsServer()
 	for coordinator.Done() {
 		time.Sleep(time.Second)
 	}

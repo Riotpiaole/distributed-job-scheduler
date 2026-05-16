@@ -1,13 +1,62 @@
 package pipeline
 
+/**
+
+func main() {
+	// Create the list of functions
+	funcList := []StreamProcessAction{
+		// Function 1: Expects (int, int), returns (sum int, product int)
+		func(args ...any) []any {
+			if len(args) < 2 {
+				return []any{0, 0}
+			}
+			a, ok1 := args[0].(int)
+			b, ok2 := args[1].(int)
+			if !ok1 || !ok2 {
+				return []any{0, 0}
+			}
+			return []any{a + b, a * b}
+		},
+
+		// Function 2: Expects (string, int), returns (repeated string)
+		func(args ...any) []any {
+			if len(args) < 2 {
+				return []any{""}
+			}
+			str, ok1 := args[0].(string)
+			count, ok2 := args[1].(int)
+			if !ok1 || !ok2 {
+				return []any{""}
+			}
+			result := ""
+			for i := 0; i < count; i++ {
+				result += str
+			}
+			return []any{result}
+		},
+	}
+
+	// Execute the math function
+	mathResults := funcList[0](10, 5)
+	fmt.Printf("Math Outputs: Sum = %v, Product = %v\n", mathResults[0], mathResults[1])
+
+	// Execute the string function
+	strResults := funcList[1]("Go", 3)
+	fmt.Printf("String Output: %v\n", strResults[0])
+}
+**/
+
+type StreamProcessAction func(args ...any) []any
+
 // apache flink similar API to process streaming data,
 // we can implement a simple version of it for our log processing system
 type StreamProcess interface {
-	Filter(validateFunc func(string) bool) StreamProcess
-	Map(mapFunc func(string) string) StreamProcess
-	Reduce(reduceFunc func(string, string) string) StreamProcess
-	GroupBy(groupFunc func(string) string) StreamProcess
-	Sink(sinkFunc func(string) error) error
+	Filter(validateFunc StreamProcessAction) StreamProcess
+	Map(mapFunc StreamProcessAction) StreamProcess
+	Sequential(aggergateFunc StreamProcessAction) StreamProcess
+	Reduce(reduceFunc StreamProcessAction) StreamProcess
+	GroupBy(groupFunc StreamProcessAction) StreamProcess
+	Sink(sinkFunc StreamProcessAction) error
 }
 
 type StreamListener interface {

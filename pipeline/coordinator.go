@@ -14,32 +14,85 @@ import (
 	"github.com/emirpasic/gods/utils"
 )
 
+/*
+*
+Actions come in a slice format and we will be run them in following format and action can be Following Form
+
+- MappAlloc  -> Mapping  -> MapComplete or MapFailed
+- ReduceAlloc -> Reducing -> ReduceComplete or ReduceFailed
+- Filter -> Filtering -> Filtered or FilterFailed
+- so on .. for GroupBy and Sink
+
+*
+*/
 type TaskStatus int
 
 const (
-	MAPPING TaskStatus = iota
-	READY
-	MAPED
-	REDUCING
-	REDUCED
-	GROUPING
-	GROUPPED
-	SINKING
-	SINKED
+	// General / Initial state
+	Idle TaskStatus = iota
+
+	UnAssigned
+
+	// Map Lifecycle: MappAlloc -> Mapping -> MapComplete/MapFailed
+	MapAlloc
+	Mapping
+	MapComplete
+	MapFailed
+
+	// Reduce Lifecycle: ReduceAlloc -> Reducing -> ReduceComplete/ReduceFailed
+	ReduceAlloc
+	Reducing
+	ReduceComplete
+	ReduceFailed
+
+	// Filter Lifecycle: FilterAlloc -> Filtering -> Filtered/FilterFailed
+	FilterAlloc
+	Filtering
+	Filtered
+	FilterFailed
+
+	// GroupBy Lifecycle
+	GroupByAlloc
+	Grouping
+	Grouped
+	GroupByFailed
+
+	// Sink Lifecycle
+	SinkAlloc
+	Sinking
+	SinkComplete
+	SinkFailed
 )
 
 // 1. Define the Priority Rank Map
 // Lower number = higher priority (comes out first)
 var StatusPriority = map[TaskStatus]int{
-	READY:    1,
-	MAPPING:  2,
-	MAPED:    3,
-	REDUCING: 4,
-	REDUCED:  5,
-	GROUPING: 6,
-	GROUPPED: 7,
-	SINKING:  8,
-	SINKED:   9,
+	UnAssigned: 0,
+
+	MapAlloc:    1,
+	Mapping:     2,
+	MapComplete: 3,
+	MapFailed:   4,
+
+	ReduceAlloc:    1,
+	Reducing:       2,
+	ReduceComplete: 3,
+	ReduceFailed:   4,
+
+	FilterAlloc:  1,
+	Filtering:    2,
+	Filtered:     3,
+	FilterFailed: 4,
+
+	GroupByAlloc:  1,
+	Grouping:      2,
+	Grouped:       3,
+	GroupByFailed: 4,
+
+	SinkAlloc:    1,
+	Sinking:      2,
+	SinkComplete: 3,
+	SinkFailed:   4,
 }
 
 type TaskInfo struct {
@@ -52,6 +105,8 @@ type Coordinator struct {
 	Phase  TaskStatus
 	mu     sync.Mutex
 	readMu sync.RWMutex
+
+	ProcessAction []StreamProcessAction
 
 	NumTasks   int
 	NumReduced int
@@ -103,18 +158,19 @@ func byPriority(a, b interface{}) int {
 
 var _ TaskScheduler = (*Coordinator)(nil)
 
-func NewCoordinator() *Coordinator {
+func NewCoordinator(actions []StreamProcessAction) *Coordinator {
 	jobStatus := pq.NewWith(byPriority)
 	return &Coordinator{
-		Phase:     MAPPING,
-		JobStatus: jobStatus,
+		Phase:         Idle,
+		JobStatus:     jobStatus,
+		ProcessAction: actions,
 
 		NumTasks:   0,
 		NumReduced: 0,
 	}
 }
 
-func (c *Coordinator) StartsServer() {
+func (c *Coordinator) StartsServer(msgChan <-chan string) {
 	// start a thread that listens for RPCs from worker.g
 	rpc.Register(c)
 	rpc.HandleHTTP()
@@ -127,6 +183,8 @@ func (c *Coordinator) StartsServer() {
 	}
 
 	go http.Serve(l, nil)
+	time.Sleep(30 * time.Millisecond)
+	go c.ListenFromDataSource(msgChan)
 
 }
 
@@ -147,7 +205,7 @@ func (c *Coordinator) ListenFromDataSource(msgCh <-chan string) {
 					c.JobStatus.Enqueue(
 						&TaskInfo{
 							FilePath: msg,
-							Status:   READY,
+							Status:   UnAssigned,
 							TaskId:   c.mapIdx,
 						})
 					c.mapIdx++

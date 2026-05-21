@@ -119,6 +119,85 @@ Priority Task Queue (phase 1 = Reduce tasks, one per ChunkID)
 All phases complete → Coordinator.Done() = true → workers receive Shutdown
 ```
 
+## Coordinator ↔ Worker call sequence
+
+### Map phase
+
+```
+Worker                                      Coordinator
+  │                                              │
+  │  ── AskForTask(MsgType=AskForTask) ────────► │
+  │                                              │  dequeue next TaskInfo from priority queue
+  │                                              │  mark task in-flight (DispatchedAt = now)
+  │ ◄─ TaskAlloc(ChunkID, ActionIndex=0, ──────  │
+  │              PhaseIdx, NReduce)              │
+  │                                              │
+  │  ── GetChunk(ChunkID) ─────────────────────► │
+  │ ◄─ ChunkReply(Content []byte) ─────────────  │  raw bytes served from chunkStore
+  │                                              │
+  │  [run plugin.Map(filename, content)]         │
+  │  [write mr-<chunkID>-<bucket> to disk]       │
+  │                                              │
+  │  ── NoticeResult(TaskSuccess, TaskID, ─────► │
+  │                  PhaseIdx)                   │  phaseDone++; delete chunk from chunkStore
+  │                                              │  if all map tasks done → transitionToNextPhase()
+```
+
+### Reduce phase
+
+```
+Worker                                      Coordinator
+  │                                              │
+  │  ── AskForTask(MsgType=AskForTask) ────────► │
+  │                                              │  dequeue reduce TaskInfo (one per ChunkID)
+  │ ◄─ TaskAlloc(TaskName=ChunkID, ────────────  │
+  │              ActionIndex=1, PhaseIdx)        │
+  │                                              │
+  │  [glob mr-<ChunkID>-* from disk]             │
+  │  [sort + group by key]                       │
+  │  [run plugin.Reduce(key, values)]            │
+  │  [write mr-out-<ChunkID> to disk]            │
+  │                                              │
+  │  ── NoticeResult(TaskSuccess, TaskID, ─────► │
+  │                  PhaseIdx)                   │  phaseDone++
+  │                                              │  if all reduce tasks done → Done() = true
+```
+
+### Task failure and retry
+
+```
+Worker                                      Coordinator
+  │                                              │
+  │  [task fails mid-execution]                  │
+  │  ── NoticeResult(TaskFailed, TaskID, ──────► │
+  │                  PhaseIdx)                   │  task.Retries++
+  │                                              │  if Retries < 3 → re-enqueue task
+  │                                              │  if Retries >= 3 → give up, phaseDone++
+```
+
+### Worker stall / crash (sweeper path)
+
+```
+Worker                                      Coordinator (sweeper goroutine, every 5s)
+  │                                              │
+  │  [worker process hangs or dies]              │
+  │  [no NoticeResult arrives]                   │
+  │                                              │  now - task.DispatchedAt > 30s
+  │                                              │  task.Retries++
+  │                                              │  re-enqueue task (or give up after 3 retries)
+```
+
+### Shutdown
+
+```
+Worker                                      Coordinator
+  │                                              │
+  │  ── AskForTask ────────────────────────────► │  Done() == true
+  │ ◄─ Shutdown ───────────────────────────────  │
+  │                                              │
+  │  [worker exits]                              │
+```
+
 ## Scaling the MapReduce
 
 Workers are completely stateless between tasks. To increase throughput:

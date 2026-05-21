@@ -14,12 +14,15 @@ replace riotpiaole.com/vec_db_pipeline => ../slogger
 
 require (
 	github.com/emirpasic/gods v1.18.1
+	github.com/google/uuid v1.6.0
+	github.com/joho/godotenv v1.5.1
+	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58
+	github.com/serialx/hashring v0.0.0-20200727003509-22c0c7ab6b1b
 	github.com/spf13/cobra v1.10.2
 )
 
 require (
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
-	github.com/joho/godotenv v1.5.1 // indirect
-	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
+	github.com/stretchr/testify v1.11.1 // indirect
 )

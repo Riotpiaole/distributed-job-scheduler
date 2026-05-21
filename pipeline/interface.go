@@ -46,17 +46,29 @@ func main() {
 }
 **/
 
-type StreamProcessAction func(args ...any) []any
+type TaskType int
+
+const (
+	MapTask TaskType = iota
+	ReduceTask
+	GroupTask
+	FilterTask
+	SinkTask
+)
+
+type StreamProcessAction struct {
+	Action     func(args ...any) any
+	ActionType TaskType
+}
 
 // apache flink similar API to process streaming data,
 // we can implement a simple version of it for our log processing system
 type StreamProcess interface {
-	Filter(validateFunc StreamProcessAction) StreamProcess
-	Map(mapFunc StreamProcessAction) StreamProcess
-	Sequential(aggergateFunc StreamProcessAction) StreamProcess
-	Reduce(reduceFunc StreamProcessAction) StreamProcess
-	GroupBy(groupFunc StreamProcessAction) StreamProcess
-	Sink(sinkFunc StreamProcessAction) error
+	// Filter(validateFunc StreamProcessAction) StreamProcess
+	Map(mapFunc StreamProcessAction) []KeyValue // map is group the values into key upto nreduce
+	Reduce(reduceFunc StreamProcessAction) any  // reduce is run by pick one key but return one of the key
+	SelectKey(groupFunc StreamProcessAction) any
+	Sink(sinkFunc StreamProcessAction) error // a flusking function where worker flush this change to an secondary source
 }
 
 type StreamListener interface {

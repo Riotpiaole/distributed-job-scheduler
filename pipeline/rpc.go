@@ -3,20 +3,20 @@ package pipeline
 import (
 	"os"
 	"strconv"
+	"sync"
 )
 
 type MsgType int
+type Key string
 
 const (
-	AskForTask       MsgType = iota // `Worker`请求任务
-	MapTaskAlloc                    // `Coordinator`分配`Map`任务
-	ReduceTaskAlloc                 // `Coordinator`分配`Reduce`任务
-	MapSuccess                      // `Worker`报告`Map`任务的执行成功
-	MapTaskFailed                   // `Worker`报告`Map`任务的执行失败
-	ReduceSuccess                   // `Worker`报告`Reduce`任务的执行成功
-	ReduceTaskFailed                //`Worker`报告`Reduce`任务的执行失败
-	Shutdown                        // `Coordinator`告知`Worker`退出（所有任务执行成功）
-	Wait                            //`Coordinator`告知`Worker`休眠（暂时没有任务需要执行）
+	AskForTask   MsgType = iota
+	TaskAlloc            // generic task dispatch for any phase
+	TaskSuccess          // generic completion report
+	TaskFailed           // generic failure report
+	TaskContinue         // worker finished one chunk; more file data remains
+	Shutdown
+	Wait
 )
 
 type MicroBatchMsg struct {
@@ -31,28 +31,54 @@ type TaskScheduler interface {
 
 type TaskProcessor interface {
 	CallForTask() *MessageReply
-	CallForStatusReport(MsgType, int) bool
+	CallForStatusReport(status MsgType, taskId int, taskName string, phaseIdx int) bool
 }
 
+// MessageSend is sent from worker → coordinator.
 type MessageSend struct {
-	MsgType MsgType
-	TaskID  int
+	MsgType    MsgType
+	TaskID     int
+	TaskName   string
+	PhaseIdx   int   // which phase this report belongs to
+	NextOffset int64 // for TaskContinue: byte offset of the next unprocessed chunk
 }
 
+// MessageReply is sent from coordinator → worker.
 type MessageReply struct {
-	MsgType  MsgType
-	NReduce  int
-	TaskID   int
-	TaskName string
+	MsgType     MsgType
+	NReduce     int
+	TaskID      int
+	TaskName    string // file path for phase 0 (map)
+	BucketID    int    // partition index for phase 1+ (reduce, etc.)
+	ActionIndex int    // index into worker's actions slice
+	PhaseIdx    int    // coordinator's current phaseIdx at dispatch time
+	ChunkOffset int64  // byte offset where this map task should begin reading
 }
 
-// Cook up a unique-ish UNIX-domain socket name
-// in /var/tmp, for the coordinator.
-// Can't use the current directory since
-// Athena AFS doesn't support UNIX-domain sockets.
+// KeyValue is the fundamental unit exchanged between map and reduce workers.
+type KeyValue struct {
+	Key   Key
+	Value any
+}
+
+// IntermediateStore is shared in-process between the coordinator and workers.
+// Map workers write to buckets; reduce workers read from buckets and write to results.
+type IntermediateStore struct {
+	mu      sync.Mutex
+	buckets [][]KeyValue
+	results []KeyValue
+}
+
+func NewIntermediateStore(nReduce int) *IntermediateStore {
+	return &IntermediateStore{
+		buckets: make([][]KeyValue, nReduce),
+		results: []KeyValue{},
+	}
+}
+
+// coordinatorSock returns a unique-ish UNIX-domain socket path in /var/tmp.
 func coordinatorSock() string {
 	s := "/var/tmp/5840-mr-"
-
 	s += strconv.Itoa(os.Getuid())
 	return s
 }

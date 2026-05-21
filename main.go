@@ -11,8 +11,11 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
+	"unicode"
 
 	"github.com/joho/godotenv"
 	"github.com/pbnjay/memory"
@@ -21,36 +24,43 @@ import (
 	"riotpiaole.com/vec_db_pipeline/pipeline/datasource"
 )
 
+func defaultOutputDir() string {
+	wd, err := os.Getwd()
+	if err != nil {
+		return pipeline.DefaultOutputDir
+	}
+	return filepath.Join(wd, pipeline.DefaultOutputDir)
+}
+
 func main() {
+	var outputDir string
+
 	var rootCmd = &cobra.Command{
 		Use:   " [inputs...] processor.so",
 		Short: "Run an ETL process with given files and a shared object plugin",
 		Args:  cobra.MinimumNArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
-			// The last argument is the .so file
-
-			// Everything before the last argument is part of the input
 			inputs := args[0]
 
 			fmt.Printf("🚀 Starting ETL Process\n")
 			fmt.Printf("📂 Inputs:    %v\n", inputs)
-			// fmt.Printf("⚙️  Processor: %s\n", processor)
+			fmt.Printf("📁 Output:    %v\n", outputDir)
 
-			// Logic to handle DB URL vs File Dir vs File List would go here
-			RunPipeline(inputs)
+			RunPipeline(inputs, outputDir)
 		},
 	}
 
-	var workerCmd = &cobra.Command{
-		Use:   "worker",
-		Short: "Run a worker",
-		Args:  cobra.MinimumNArgs(0),
-		Run: func(cmd *cobra.Command, args []string) {
-			// _ := args[0]
-			pipeline.StartWorker()
-		},
-	}
-	rootCmd.AddCommand(workerCmd)
+	// var workerCmd = &cobra.Command{
+	// 	Use:   "worker",
+	// 	Short: "Run a worker",
+	// 	Args:  cobra.MinimumNArgs(3),
+	// 	Run: func(cmd *cobra.Command, args []string) {
+	// 		// _ := args[0]
+	// 		pipeline.StartWorker(uuid.New().String(), []pipeline.StreamProcessAction{}, outputDir)
+	// 	},
+	// }
+	// rootCmd.AddCommand(workerCmd)
+	rootCmd.Flags().StringVarP(&outputDir, "output", "o", defaultOutputDir(), "directory for intermediate and output files")
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
@@ -96,11 +106,32 @@ func resolveNumWorkers() int {
 	return NUM_WORKER
 }
 
-func RunPipeline(filePath string) {
-	numWorkers := resolveNumWorkers()
+func RunPipeline(filePath string, outputDir string) {
+	numWorkers := 10
 	datasource := datasource.FilesDataSource{
 		FilePath: filePath,
 	}
-	ppl := pipeline.NewPipeline(&datasource, numWorkers, func(s string) string { return "" })
+	ppl := pipeline.NewPipeline(&datasource, numWorkers)
+	ppl.OutputDir = outputDir
+	ppl.Map(func(args ...any) any {
+		filename, _ := args[0].(string)
+		contents, _ := args[1].(string)
+		_ = filename
+
+		ff := func(r rune) bool { return !unicode.IsLetter(r) }
+		words := strings.FieldsFunc(contents, ff)
+
+		kva := make([]pipeline.KeyValue, 0, len(words))
+		for _, w := range words {
+			kva = append(kva, pipeline.KeyValue{Key: pipeline.Key(w), Value: "1"})
+		}
+		return kva
+	})
+
+	ppl.Reduce(func(args ...any) any {
+		values, _ := args[1].([]string)
+		// return the number of occurrences of this word.
+		return strconv.Itoa(len(values))
+	})
 	ppl.Start()
 }

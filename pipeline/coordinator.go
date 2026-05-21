@@ -14,229 +14,319 @@ import (
 	"github.com/emirpasic/gods/utils"
 )
 
-/*
-*
-Actions come in a slice format and we will be run them in following format and action can be Following Form
-
-- MappAlloc  -> Mapping  -> MapComplete or MapFailed
-- ReduceAlloc -> Reducing -> ReduceComplete or ReduceFailed
-- Filter -> Filtering -> Filtered or FilterFailed
-- so on .. for GroupBy and Sink
-
-*
-*/
-type TaskStatus int
-
 const (
-	// General / Initial state
-	Idle TaskStatus = iota
-
-	UnAssigned
-
-	// Map Lifecycle: MappAlloc -> Mapping -> MapComplete/MapFailed
-	MapAlloc
-	Mapping
-	MapComplete
-	MapFailed
-
-	// Reduce Lifecycle: ReduceAlloc -> Reducing -> ReduceComplete/ReduceFailed
-	ReduceAlloc
-	Reducing
-	ReduceComplete
-	ReduceFailed
-
-	// Filter Lifecycle: FilterAlloc -> Filtering -> Filtered/FilterFailed
-	FilterAlloc
-	Filtering
-	Filtered
-	FilterFailed
-
-	// GroupBy Lifecycle
-	GroupByAlloc
-	Grouping
-	Grouped
-	GroupByFailed
-
-	// Sink Lifecycle
-	SinkAlloc
-	Sinking
-	SinkComplete
-	SinkFailed
+	maxRetries     = 3
+	taskTimeout    = 30 * time.Second // re-enqueue in-flight tasks that exceed this
+	sweepInterval  = 5 * time.Second  // how often the timeout sweeper runs
 )
 
-// 1. Define the Priority Rank Map
-// Lower number = higher priority (comes out first)
-var StatusPriority = map[TaskStatus]int{
-	UnAssigned: 0,
-
-	MapAlloc:    1,
-	Mapping:     2,
-	MapComplete: 3,
-	MapFailed:   4,
-
-	ReduceAlloc:    1,
-	Reducing:       2,
-	ReduceComplete: 3,
-	ReduceFailed:   4,
-
-	FilterAlloc:  1,
-	Filtering:    2,
-	Filtered:     3,
-	FilterFailed: 4,
-
-	GroupByAlloc:  1,
-	Grouping:      2,
-	Grouped:       3,
-	GroupByFailed: 4,
-
-	SinkAlloc:    1,
-	Sinking:      2,
-	SinkComplete: 3,
-	SinkFailed:   4,
-}
-
 type TaskInfo struct {
-	FilePath string
-	Status   TaskStatus
-	TaskId   int
+	FilePath     string
+	Status       TaskStatus
+	TaskId       int
+	PhaseIdx     int       // which phase this task belongs to
+	Retries      int       // how many times this task has been retried
+	DispatchedAt time.Time // when it was last handed to a worker (zero = not dispatched)
+	ChunkOffset  int64     // byte offset where the next map chunk begins (0 = start of file)
 }
 
 type Coordinator struct {
-	Phase  TaskStatus
-	mu     sync.Mutex
-	readMu sync.RWMutex
+	mu sync.Mutex
 
 	ProcessAction []StreamProcessAction
 
-	NumTasks   int
-	NumReduced int
+	// phaseIdx is the cursor into ProcessAction.
+	// Phase 0 = map (tasks from data source).
+	// Phase 1+ = subsequent stages (NReduce partitioned tasks each).
+	// phaseIdx == len(ProcessAction) means all phases complete.
+	phaseIdx int
 
-	mapIdx    int
-	reduceIdx int
+	NReduce  int
+	NumTasks int // total map tasks ever enqueued (grows as source streams)
+
+	// phaseDone counts completed tasks in the current phase.
+	phaseDone int
+
+	// failedTasks counts tasks that exhausted their retries this phase.
+	failedTasks int
+
+	// sourceDone is set when the data source channel closes.
+	sourceDone bool
 
 	JobStatus *pq.Queue
-}
 
-// AskForTask implements TaskScheduler.
-func (c *Coordinator) AskForTask(req *MessageSend, reply *MessageReply) error {
-	if req.MsgType != AskForTask {
-		log.Println("Bad Message recevied \n")
-		return fmt.Errorf("Bad Message type")
-	}
+	// inFlight tracks dispatched tasks that haven't reported back yet.
+	// Key = TaskId. Used to detect crashed workers via the timeout sweeper.
+	inFlight map[int]*TaskInfo
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	fmt.Printf("A worker is ask for task\n")
+	// taskFiles maps TaskId → source FilePath, populated during the map phase
+	// so reduce tasks can carry the same TaskName.
+	taskFiles map[int]string
 
-	task, empty := c.NextJob()
-	if empty && c.Done() {
-		reply.MsgType = Shutdown
-		return nil
-	}
-
-	if !empty {
-		reply.MsgType = MapTaskAlloc
-		reply.TaskID = task.TaskId
-		reply.TaskName = task.FilePath
-	}
-
-	// we reached the task became empty and we need to
-
-	return nil
-}
-
-// NoticeResult implements TaskScheduler.
-func (c *Coordinator) NoticeResult(req *MessageSend, reply *MessageReply) error {
-	return nil
+	Intermediates *IntermediateStore
 }
 
 func byPriority(a, b interface{}) int {
 	priorityA := StatusPriority[a.(*TaskInfo).Status]
 	priorityB := StatusPriority[b.(*TaskInfo).Status]
-	return -utils.IntComparator(priorityA, priorityB) // "-" descending order
+	return -utils.IntComparator(priorityA, priorityB)
 }
 
 var _ TaskScheduler = (*Coordinator)(nil)
 
-func NewCoordinator(actions []StreamProcessAction) *Coordinator {
-	jobStatus := pq.NewWith(byPriority)
+func NewCoordinator(nReduce int, actions []StreamProcessAction) *Coordinator {
 	return &Coordinator{
-		Phase:         Idle,
-		JobStatus:     jobStatus,
 		ProcessAction: actions,
-
-		NumTasks:   0,
-		NumReduced: 0,
+		phaseIdx:      0,
+		NReduce:       nReduce,
+		JobStatus:     pq.NewWith(byPriority),
+		inFlight:      make(map[int]*TaskInfo),
+		taskFiles:     make(map[int]string),
+		Intermediates: NewIntermediateStore(nReduce),
 	}
 }
 
-func (c *Coordinator) StartsServer(msgChan <-chan string) {
-	// start a thread that listens for RPCs from worker.g
+// AskForTask implements TaskScheduler.
+func (c *Coordinator) AskForTask(req *MessageSend, reply *MessageReply) error {
+	if req.MsgType != AskForTask {
+		return fmt.Errorf("bad message type")
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.done() {
+		reply.MsgType = Shutdown
+		return nil
+	}
+
+	task, empty := c.nextJob()
+	if empty {
+		if c.currentPhaseComplete() {
+			c.transitionToNextPhase()
+			if c.done() {
+				reply.MsgType = Shutdown
+				return nil
+			}
+		}
+		reply.MsgType = Wait
+		return nil
+	}
+
+	// Mark in-flight so the timeout sweeper can recover it on worker crash.
+	task.DispatchedAt = time.Now()
+	task.PhaseIdx = c.phaseIdx
+	c.inFlight[task.TaskId] = task
+
+	reply.MsgType = TaskAlloc
+	reply.TaskID = task.TaskId
+	reply.TaskName = task.FilePath
+	reply.BucketID = task.TaskId
+	reply.NReduce = c.NReduce
+	reply.ActionIndex = c.phaseIdx
+	reply.PhaseIdx = c.phaseIdx
+	reply.ChunkOffset = task.ChunkOffset
+	return nil
+}
+
+// NoticeResult implements TaskScheduler.
+func (c *Coordinator) NoticeResult(req *MessageSend, reply *MessageReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Ignore reports from a stale phase (coordinator already moved on).
+	if req.PhaseIdx != c.phaseIdx {
+		fmt.Printf("[coordinator] stale report for phase %d (current %d), ignoring\n",
+			req.PhaseIdx, c.phaseIdx)
+		return nil
+	}
+
+	task, inflight := c.inFlight[req.TaskID]
+	if inflight {
+		delete(c.inFlight, req.TaskID)
+	}
+
+	switch req.MsgType {
+	case TaskSuccess:
+		c.phaseDone++
+		fmt.Printf("[coordinator] phase %d: task %d succeeded (%d/%d done)\n",
+			req.PhaseIdx, req.TaskID, c.phaseDone, c.phaseTotal())
+
+	case TaskContinue:
+		if !inflight {
+			return nil
+		}
+		task.ChunkOffset = req.NextOffset
+		task.Status = UnAssigned
+		task.DispatchedAt = time.Time{}
+		c.JobStatus.Enqueue(task)
+		fmt.Printf("[coordinator] phase %d: task %d continuing at offset %d\n",
+			req.PhaseIdx, req.TaskID, req.NextOffset)
+
+	case TaskFailed:
+		if !inflight {
+			// No in-flight record — duplicate or phantom report; ignore.
+			return nil
+		}
+		task.Retries++
+		if task.Retries >= maxRetries {
+			c.failedTasks++
+			fmt.Printf("[coordinator] phase %d: task %d exhausted %d retries — giving up\n",
+				req.PhaseIdx, req.TaskID, maxRetries)
+			// Count as done so the phase can still complete (with partial results).
+			c.phaseDone++
+		} else {
+			task.Status = UnAssigned
+			task.DispatchedAt = time.Time{}
+			c.JobStatus.Enqueue(task)
+			fmt.Printf("[coordinator] phase %d: task %d failed (retry %d/%d), re-enqueued\n",
+				req.PhaseIdx, req.TaskID, task.Retries, maxRetries)
+		}
+	}
+
+	return nil
+}
+
+// sweepTimedOutTasks re-enqueues any in-flight task that has exceeded taskTimeout.
+// Called periodically by the background sweeper goroutine — not holding mu on entry.
+func (c *Coordinator) sweepTimedOutTasks() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := time.Now()
+	for id, task := range c.inFlight {
+		if !task.DispatchedAt.IsZero() && now.Sub(task.DispatchedAt) > taskTimeout {
+			delete(c.inFlight, id)
+			task.Retries++
+			if task.Retries >= maxRetries {
+				c.failedTasks++
+				c.phaseDone++
+				fmt.Printf("[coordinator] task %d timed out and exhausted retries — giving up\n", id)
+			} else {
+				task.Status = UnAssigned
+				task.DispatchedAt = time.Time{}
+				c.JobStatus.Enqueue(task)
+				fmt.Printf("[coordinator] task %d timed out (retry %d/%d), re-enqueued\n",
+					id, task.Retries, maxRetries)
+			}
+		}
+	}
+}
+
+// phaseTotal returns the expected number of completions for the current phase.
+func (c *Coordinator) phaseTotal() int {
+	return c.NumTasks
+}
+
+// transitionToNextPhase advances phaseIdx and enqueues tasks for the new phase.
+func (c *Coordinator) transitionToNextPhase() {
+	c.phaseIdx++
+	c.phaseDone = 0
+	c.failedTasks = 0
+	c.inFlight = make(map[int]*TaskInfo)
+
+	if c.done() {
+		fmt.Println("[coordinator] all phases complete")
+		return
+	}
+
+	action := c.ProcessAction[c.phaseIdx]
+	fmt.Printf("[coordinator] transitioning to phase %d (%v)\n", c.phaseIdx, action.ActionType)
+
+	switch action.ActionType {
+	case MapTask:
+		// tasks arrive dynamically from the data source — nothing to enqueue here
+	default:
+		// One reduce task per map task: workers glob mr-{TaskName}-*-* to find all chunks.
+		for i := 0; i < c.NumTasks; i++ {
+			c.JobStatus.Enqueue(&TaskInfo{
+				TaskId:   i,
+				FilePath: c.taskFiles[i],
+				Status:   UnAssigned,
+				PhaseIdx: c.phaseIdx,
+			})
+		}
+	}
+}
+
+// currentPhaseComplete returns true when all tasks for the active phase have finished
+// (either succeeded or exhausted retries).
+func (c *Coordinator) currentPhaseComplete() bool {
+	allReported := c.phaseDone == c.phaseTotal()
+	noneInFlight := len(c.inFlight) == 0
+	switch c.ProcessAction[c.phaseIdx].ActionType {
+	case MapTask:
+		return c.sourceDone && allReported && noneInFlight
+	default:
+		return allReported && noneInFlight
+	}
+}
+
+func (c *Coordinator) done() bool {
+	return c.phaseIdx >= len(c.ProcessAction)
+}
+
+func (c *Coordinator) Done() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.done()
+}
+
+func (c *Coordinator) nextJob() (*TaskInfo, bool) {
+	item, ok := c.JobStatus.Dequeue()
+	if !ok {
+		return nil, true
+	}
+	return item.(*TaskInfo), false
+}
+
+func (c *Coordinator) Start(msgChan <-chan string) {
 	rpc.Register(c)
 	rpc.HandleHTTP()
-	// l, e := net.Listen("tcp", ":1234")
 	sockname := coordinatorSock()
 	os.Remove(sockname)
 	l, e := net.Listen("unix", sockname)
 	if e != nil {
 		log.Fatal("listen error:", e)
 	}
-
 	go http.Serve(l, nil)
 	time.Sleep(30 * time.Millisecond)
-	go c.ListenFromDataSource(msgChan)
 
+	go c.listenFromDataSource(msgChan)
+	go c.runSweeper()
 }
 
-func (c *Coordinator) ListenFromDataSource(msgCh <-chan string) {
-	fmt.Printf("Started Coordinator Listening from msgChan\n")
-	// message collector it collects the msg and proceed to send the worker
-	go func() {
-		for {
-
-			select {
-			case msg, ok := <-msgCh:
-				if !ok {
-					fmt.Println("Channel is closed ")
-					return
-				}
-				fmt.Printf("Received Msg, %v\n", msg)
-				if c.mu.TryLock() {
-					c.JobStatus.Enqueue(
-						&TaskInfo{
-							FilePath: msg,
-							Status:   UnAssigned,
-							TaskId:   c.mapIdx,
-						})
-					c.mapIdx++
-					c.NumTasks++
-
-					c.mu.Unlock()
-				}
-				time.Sleep(30 * time.Millisecond)
-			case <-time.After(1 * time.Second):
-				fmt.Println("Timed out: No message arrived after 1 second.")
-			default:
-			}
-			time.Sleep(30 * time.Millisecond)
+// runSweeper periodically re-enqueues tasks whose workers have gone silent.
+func (c *Coordinator) runSweeper() {
+	ticker := time.NewTicker(sweepInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		if c.Done() {
+			return
 		}
-	}()
-}
-
-func (c *Coordinator) NextJob() (*TaskInfo, bool) {
-	c.readMu.RLock()
-	defer c.readMu.RUnlock()
-
-	incompletedTask, hasElement := c.JobStatus.Dequeue()
-
-	if !hasElement {
-		// our task is completed
-		return nil, true
+		c.sweepTimedOutTasks()
 	}
-	fmt.Printf("Check for queue %+v \n", incompletedTask)
-	return incompletedTask.(*TaskInfo), false
 }
 
-func (c *Coordinator) Done() bool {
-	return c.mapIdx == c.NumTasks && c.NumReduced == c.reduceIdx
+func (c *Coordinator) listenFromDataSource(msgCh <-chan string) {
+	fmt.Println("[coordinator] listening from data source")
+	idx := 0
+	for msg := range msgCh {
+		c.mu.Lock()
+		c.JobStatus.Enqueue(&TaskInfo{
+			FilePath: msg,
+			Status:   UnAssigned,
+			TaskId:   idx,
+			PhaseIdx: 0,
+		})
+		c.taskFiles[idx] = msg
+		idx++
+		c.NumTasks++
+		c.mu.Unlock()
+		fmt.Printf("[coordinator] enqueued map task %d: %s\n", idx-1, msg)
+	}
+	c.mu.Lock()
+	c.sourceDone = true
+	c.mu.Unlock()
+	fmt.Println("[coordinator] data source exhausted")
 }

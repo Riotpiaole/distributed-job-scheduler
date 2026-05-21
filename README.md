@@ -1,6 +1,6 @@
 # go-flink
 
-A distributed MapReduce pipeline engine written in Go. Processing logic is compiled into `.so` plugins and loaded at runtime, letting you scale out by launching as many worker processes as needed — each one just needs the same `.so` file.
+A distributed MapReduce pipeline engine written in Go. 
 
 ## How it works
 

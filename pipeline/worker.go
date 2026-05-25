@@ -108,7 +108,6 @@ func runWorkerLoop(w *Worker) {
 func (w *Worker) invoke(reply *MessageReply) error {
 	w.activeReply = reply
 	w.lastErr = nil
-	defer func() { w.activeReply = nil }()
 
 	switch reply.ActionType {
 	case SinkTask:

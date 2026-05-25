@@ -56,20 +56,27 @@ func main() {
 	// worker subcommand: start a worker that pulls tasks from the coordinator
 	var workerID int
 	var workerPluginDir string
+	var workerCoordinatorAddr string
 
 	workerCmd := &cobra.Command{
 		Use:   "worker",
 		Short: "Start a worker process that loads plugins on demand from --plugin-dir",
 		Run: func(cmd *cobra.Command, args []string) {
 			registry := pipeline.NewPluginRegistry(workerPluginDir)
-			fmt.Printf("[worker %d] started, plugin-dir=%s output=%s\n",
-				workerID, workerPluginDir, outputDir)
-			pipeline.StartWorker(workerID, registry, outputDir)
+			fmt.Printf("[worker %d] started, plugin-dir=%s output=%s coordinator=%s\n",
+				workerID, workerPluginDir, outputDir, workerCoordinatorAddr)
+			if workerCoordinatorAddr != "" {
+				pipeline.StartWorkerRemote(workerID, registry, outputDir, workerCoordinatorAddr)
+			} else {
+				pipeline.StartWorker(workerID, registry, outputDir)
+			}
 		},
 	}
 	workerCmd.Flags().IntVar(&workerID, "id", os.Getpid(), "worker ID")
 	workerCmd.Flags().StringVar(&workerPluginDir, "plugin-dir", "./plugins",
 		"directory containing .so plugins (loaded on demand)")
+	workerCmd.Flags().StringVar(&workerCoordinatorAddr, "coordinator", "",
+		"coordinator RPC address (host:port); empty = embedded Unix socket mode")
 
 	// submit subcommand: send a job to a running cluster
 	var clusterAddr string

@@ -1,0 +1,31 @@
+## Shared output PVC for minikube (single-node).
+## All coordinator + worker pods on the same node can share a hostPath volume.
+## For production replace with a ReadWriteMany storage class (NFS, EFS, Azure File, etc.).
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: go-flink-output-pv
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+  - ReadWriteMany
+  hostPath:
+    path: /mnt/go-flink-output
+    type: DirectoryOrCreate
+  storageClassName: ""
+  persistentVolumeReclaimPolicy: Retain
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: go-flink-output
+spec:
+  accessModes:
+  - ReadWriteMany
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: ""
+  volumeName: go-flink-output-pv

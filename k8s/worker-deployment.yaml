@@ -1,0 +1,55 @@
+## Worker pool — stateless pods that execute Map/Reduce/Sink tasks.
+## Workers poll the coordinator leader (go-flink-rpc:8000) for tasks.
+## They are the only pods that read/write intermediate files (/data/output).
+## Scale independently of the coordinator: kubectl scale deployment go-flink-worker --replicas=N
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: go-flink-worker
+  labels:
+    app: go-flink-worker
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: go-flink-worker
+  template:
+    metadata:
+      labels:
+        app: go-flink-worker
+    spec:
+      initContainers:
+      - name: init-plugins
+        image: goflink:v1.0.0
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c", "cp -rn /plugins/. /mnt/plugins/"]
+        volumeMounts:
+        - name: plugins
+          mountPath: /mnt/plugins
+      containers:
+      - name: worker
+        image: goflink:v1.0.0
+        imagePullPolicy: IfNotPresent
+        command:
+        - /usr/local/bin/go-flink
+        - -o=/data/output
+        - worker
+        - --coordinator=go-flink-rpc:8000
+        - --plugin-dir=/plugins
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        volumeMounts:
+        - name: plugins
+          mountPath: /plugins
+        - name: output
+          mountPath: /data/output
+      volumes:
+      - name: plugins
+        persistentVolumeClaim:
+          claimName: go-flink-plugins
+      - name: output
+        persistentVolumeClaim:
+          claimName: go-flink-output    # ReadWriteMany — shared across all worker pods

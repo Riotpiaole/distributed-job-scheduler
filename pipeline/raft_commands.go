@@ -60,7 +60,9 @@ func (c *Coordinator) Apply(l *raft.Log) interface{} {
 	switch cmd.Type {
 	case CmdEnqueueTask:
 		if cmd.Task != nil {
-			c.chunkStore[cmd.Task.ChunkID] = nil // placeholder; content fetched separately
+			if _, exists := c.chunkStore[cmd.Task.ChunkID]; !exists {
+				c.chunkStore[cmd.Task.ChunkID] = nil // placeholder for follower nodes; leader already stored content
+			}
 			c.JobStatus.Enqueue(cmd.Task)
 			c.taskFiles[cmd.Task.TaskId] = cmd.Task.ChunkID
 			c.taskFileNames[cmd.Task.TaskId] = cmd.Task.FileName

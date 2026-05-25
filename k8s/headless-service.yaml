@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: go-flink
+  labels:
+    app: go-flink
+spec:
+  clusterIP: None        # headless — gives each pod stable DNS: <pod>.go-flink.<ns>.svc.cluster.local
+  selector:
+    app: go-flink
+  ports:
+  - name: raft
+    port: 7000
+    targetPort: 7000
+  - name: rpc
+    port: 8000
+    targetPort: 8000

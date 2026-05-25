@@ -36,11 +36,12 @@ type TaskProcessor interface {
 
 // MessageSend is sent from worker → coordinator.
 type MessageSend struct {
-	MsgType    MsgType
-	TaskID     int
-	TaskName   string
-	PhaseIdx   int   // which phase this report belongs to
-	NextOffset int64 // for TaskContinue: byte offset of the next unprocessed chunk
+	MsgType      MsgType
+	TaskID       int
+	TaskName     string
+	PhaseIdx     int   // which phase this report belongs to
+	NextOffset   int64 // for TaskContinue: byte offset of the next unprocessed chunk
+	DispatchedAt int64 // unix-nano of when coordinator dispatched this task; guards against stale sweeper re-enqueue
 }
 
 // MessageReply is sent from coordinator → worker.
@@ -48,13 +49,20 @@ type MessageReply struct {
 	MsgType     MsgType
 	NReduce     int
 	TaskID      int
-	TaskName    string   // file path for phase 0 (map)
-	FileName    string   // base file name of the source chunk
+	TaskName    string // file path for phase 0 (map)
+	FileName    string // base file name of the source chunk
 	ChunkID     string // UUID identifying this specific file chunk
-	BucketID    int    // partition index for phase 1+ (reduce, etc.)
-	ActionIndex int      // index into coordinator's ProcessAction slice (kept for phase tracking)
-	PhaseIdx    int      // coordinator's current phaseIdx at dispatch time
-	ChunkOffset int64    // byte offset where this map task should begin reading
+	BucketID    int    // partition index for reduce/groupby stages
+	ActionIndex int    // kept for backward compatibility; prefer StageIdx
+	PhaseIdx     int    // coordinator's current phaseIdx at dispatch time
+	ChunkOffset  int64  // byte offset where this map task should begin reading
+	DispatchedAt int64  // unix-nano timestamp of this dispatch; echoed back in MessageSend to detect stale reports
+
+	// Stage-aware execution graph fields
+	PluginName    string   // plugin filename stem to load (e.g. "wc")
+	StageIdx      int      // which stage in the pipeline this task belongs to
+	InputStageIdx int      // stage whose output files are this task's inputs
+	ActionType    TaskType // Map | Filter | Reduce | GroupBy | Sink
 }
 
 // ChunkRequest is sent from worker → coordinator to fetch raw chunk content.

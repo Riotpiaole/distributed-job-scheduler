@@ -26,6 +26,11 @@ const (
 	Grouped
 	GroupByFailed
 
+	SelectKeyAlloc
+	SelectingKey
+	SelectedKey
+	SelectKeyFailed
+
 	SinkAlloc
 	Sinking
 	SinkComplete

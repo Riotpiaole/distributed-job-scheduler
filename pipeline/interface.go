@@ -53,37 +53,15 @@ const (
 	ReduceTask
 	SelectKeyTask
 	FilterTask
+	GroupByTask
 	SinkTask
 )
 
+// StreamProcessAction describes one stage in a pipeline.
+// Name is the plugin filename stem (e.g. "wc"); ActionType determines
+// how the coordinator partitions and routes tasks for this stage.
 type StreamProcessAction struct {
-	Action     func(args ...any) any
+	Name       string
 	ActionType TaskType
 }
 
-// apache flink similar API to process streaming data,
-// we can implement a simple version of it for our log processing system
-type StreamProcess interface {
-	// Filter(validateFunc StreamProcessAction) StreamProcess
-	Map(mapFunc StreamProcessAction) []KeyValue // map is group the values into key upto nreduce
-	Reduce(reduceFunc StreamProcessAction) any  // reduce is run by pick one key but return one of the key
-	SelectKey(groupFunc StreamProcessAction) any
-	Sink(sinkFunc StreamProcessAction) error // a flusking function where worker flush this change to an secondary source
-}
-
-type StreamListener interface {
-	Listen(source <-chan string)
-	ListenRawBytes(source <-chan []byte)
-
-	// implementing more interface IE s3 or more
-}
-
-// ds = DataPipeline(SOURCE, WINDOW_SIZE, PARTITION_FUNC)
-// ds = pipeline.Filter()
-// So this define what the worker have to do each stage, and coordinater assign them to it
-// This is a high level API
-// And from there we proceed to lower level API, which is more close to the worker implementation,
-// and coordinater will assign them to it
-// Pipeline -> Coordinator -> Worker
-//  Message received upon channel
-// > ds.Listen(SOME_URL_SOURCE)

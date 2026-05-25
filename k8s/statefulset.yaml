@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: go-flink
+spec:
+  serviceName: go-flink      # links to headless service → stable DNS
+  replicas: 3
+  selector:
+    matchLabels:
+      app: go-flink
+  template:
+    metadata:
+      labels:
+        app: go-flink
+    spec:
+      initContainers:
+      - name: init-plugins
+        image: go-flink:latest
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c", "cp -rn /plugins/. /mnt/plugins/"]
+        volumeMounts:
+        - name: plugins
+          mountPath: /mnt/plugins
+      containers:
+      - name: node
+        image: go-flink:latest
+        imagePullPolicy: IfNotPresent
+        command:
+        - /usr/local/bin/go-flink
+        - node
+        - --node-id=$(POD_NAME)
+        - --raft-bind=$(POD_NAME).go-flink:7000
+        # Peer list: each entry is raftAddr=rpcAddr so followers can reach the leader.
+        - --raft-peers=go-flink-0.go-flink:7000=go-flink-0.go-flink:8000,go-flink-1.go-flink:7000=go-flink-1.go-flink:8000,go-flink-2.go-flink:7000=go-flink-2.go-flink:8000
+        - --bind=:8000
+        - --plugin-dir=/plugins
+        - --data-dir=/data/raft
+        - --output=/data/output
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name   # injected as "go-flink-0", "go-flink-1", etc.
+        ports:
+        - name: raft
+          containerPort: 7000
+        - name: rpc
+          containerPort: 8000
+        volumeMounts:
+        - name: raft-data
+          mountPath: /data/raft
+        - name: plugins
+          mountPath: /plugins
+        - name: input
+          mountPath: /data/input
+        - name: output
+          mountPath: /data/output
+      volumes:
+      - name: plugins
+        persistentVolumeClaim:
+          claimName: go-flink-plugins    # ReadWriteMany — shared across all pods
+      - name: output
+        emptyDir: {}                     # replace with a shared PVC for persistent results
+  volumeClaimTemplates:
+  - metadata:
+      name: raft-data
+    spec:
+      accessModes:
+      - ReadWriteOnce                    # per-pod PVC for Raft WAL + stable store
+      resources:
+        requests:
+          storage: 1Gi

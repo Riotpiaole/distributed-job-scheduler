@@ -70,6 +70,25 @@ type DataSource interface {
 	StreamChunks(ctx context.Context) *ChunkQueue
 }
 
+// NewFromConfig constructs a DataSource from a generic config map.
+// Supported types: "file" (requires "path" key), "s3" and "kafka" are stubs.
+func NewFromConfig(sourceType string, cfg map[string]string) (DataSource, error) {
+	switch sourceType {
+	case "file":
+		path, ok := cfg["path"]
+		if !ok {
+			return nil, fmt.Errorf("file source requires \"path\" key")
+		}
+		return &FilesDataSource{FilePath: path}, nil
+	case "s3":
+		return nil, fmt.Errorf("s3 source not yet implemented")
+	case "kafka":
+		return nil, fmt.Errorf("kafka source not yet implemented")
+	default:
+		return nil, fmt.Errorf("unknown source type %q", sourceType)
+	}
+}
+
 var _ DataSource = (*FilesDataSource)(nil)
 
 type FilesDataSource struct {

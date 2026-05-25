@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: go-flink-plugins
+spec:
+  accessModes:
+  - ReadWriteMany      # all pods read; operator drops .so files here at runtime
+  resources:
+    requests:
+      storage: 500Mi
+  # storageClassName: <your-rwx-storage-class>   # e.g. nfs, azurefile, efs-sc

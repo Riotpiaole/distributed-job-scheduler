@@ -1,6 +1,8 @@
 package pipeline
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -10,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hashicorp/raft"
 	pq "github.com/emirpasic/gods/queues/priorityqueue"
 	"github.com/emirpasic/gods/utils"
 	"github.com/google/uuid"
@@ -29,6 +32,8 @@ type TaskInfo struct {
 	Status       TaskStatus
 	TaskId       int
 	PhaseIdx     int       // which phase this task belongs to
+	StageIdx     int       // same as PhaseIdx; carried into MessageReply for workers
+	PluginName   string    // plugin to invoke for this task
 	Retries      int       // how many times this task has been retried
 	DispatchedAt time.Time // when it was last handed to a worker (zero = not dispatched)
 	ChunkOffset  int64     // byte offset where the next map chunk begins (0 = start of file)
@@ -73,6 +78,15 @@ type Coordinator struct {
 	chunkStore map[string][]byte
 
 	Intermediates *IntermediateStore
+
+	// raft is nil in single-node embedded mode; set by InitRaft for distributed operation.
+	raftNode *raft.Raft
+
+	// Fields used by the unified node model (StartWithRaft).
+	myRPCAddr      string                          // this node's TCP RPC address (e.g. ":8000")
+	peerRPCAddrs   map[raft.ServerAddress]string   // raftAddr → rpcAddr for follower→leader routing
+	workerRegistry *PluginRegistry
+	workerOutputDir string
 }
 
 func byPriority(a, b interface{}) int {
@@ -82,6 +96,7 @@ func byPriority(a, b interface{}) int {
 }
 
 var _ TaskScheduler = (*Coordinator)(nil)
+var _ raft.FSM = (*Coordinator)(nil)
 
 func NewCoordinator(nReduce int, actions []StreamProcessAction) *Coordinator {
 	return &Coordinator{
@@ -97,6 +112,72 @@ func NewCoordinator(nReduce int, actions []StreamProcessAction) *Coordinator {
 	}
 }
 
+// proposeCmd proposes a state mutation through Raft when distributed, or applies
+// it directly to the FSM in single-node embedded mode.
+// MUST be called without holding c.mu — FSM.Apply acquires it internally.
+func (c *Coordinator) proposeCmd(cmd RaftCommand) error {
+	data, err := json.Marshal(cmd)
+	if err != nil {
+		return fmt.Errorf("marshal raft command: %w", err)
+	}
+	if c.raftNode == nil {
+		// Embedded single-node mode: apply directly without network round-trip.
+		if res := c.Apply(&raft.Log{Data: data}); res != nil {
+			return res.(error)
+		}
+		return nil
+	}
+	// Distributed mode: replicate via Raft consensus (blocks until committed).
+	f := c.raftNode.Apply(data, 5*time.Second)
+	return f.Error()
+}
+
+// InitRaft bootstraps a Raft cluster for this coordinator node.
+// nodeID is a unique string (e.g. "node-0"), raftBind is "host:port" for Raft
+// transport, peers is the full list of peer raftBind addresses (including self),
+// and dataDir is the directory for Raft WAL and snapshots.
+func (c *Coordinator) InitRaft(nodeID, raftBind string, peers []string, dataDir string) error {
+	cfg := raft.DefaultConfig()
+	cfg.LocalID = raft.ServerID(nodeID)
+
+	transport, err := raft.NewTCPTransport(raftBind, nil, 3, 10*time.Second, os.Stderr)
+	if err != nil {
+		return fmt.Errorf("raft transport: %w", err)
+	}
+
+	snapStore, err := raft.NewFileSnapshotStore(dataDir, 2, os.Stderr)
+	if err != nil {
+		return fmt.Errorf("raft snapshot store: %w", err)
+	}
+
+	logStore := raft.NewInmemStore()
+	stableStore := raft.NewInmemStore()
+
+	r, err := raft.NewRaft(cfg, c, logStore, stableStore, snapStore, transport)
+	if err != nil {
+		return fmt.Errorf("raft.NewRaft: %w", err)
+	}
+
+	// Bootstrap only when this is the first time — check by trying to get config.
+	future := r.GetConfiguration()
+	if err := future.Error(); err != nil || len(future.Configuration().Servers) == 0 {
+		servers := make([]raft.Server, len(peers))
+		for i, p := range peers {
+			servers[i] = raft.Server{
+				ID:      raft.ServerID(p),
+				Address: raft.ServerAddress(p),
+			}
+		}
+		bf := r.BootstrapCluster(raft.Configuration{Servers: servers})
+		if err := bf.Error(); err != nil && err != raft.ErrCantBootstrap {
+			return fmt.Errorf("raft bootstrap: %w", err)
+		}
+	}
+
+	c.raftNode = r
+	return nil
+}
+
 // AskForTask implements TaskScheduler.
 func (c *Coordinator) AskForTask(req *MessageSend, reply *MessageReply) error {
 	if req.MsgType != AskForTask {
@@ -104,18 +185,23 @@ func (c *Coordinator) AskForTask(req *MessageSend, reply *MessageReply) error {
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if c.done() {
+		c.mu.Unlock()
 		reply.MsgType = Shutdown
 		return nil
 	}
 
 	task, empty := c.nextJob()
 	if empty {
-		if c.currentPhaseComplete() {
+		complete := c.currentPhaseComplete()
+		c.mu.Unlock()
+		if complete {
+			// transitionToNextPhase proposes via Raft — must not hold c.mu.
 			c.transitionToNextPhase()
-			if c.done() {
+			c.mu.Lock()
+			done := c.done()
+			c.mu.Unlock()
+			if done {
 				reply.MsgType = Shutdown
 				return nil
 			}
@@ -124,85 +210,162 @@ func (c *Coordinator) AskForTask(req *MessageSend, reply *MessageReply) error {
 		return nil
 	}
 
-	// Mark in-flight so the timeout sweeper can recover it on worker crash.
-	task.DispatchedAt = time.Now()
+	// Mark in-flight (local leader state — direct mutation is fine here).
+	now := time.Now()
+	task.DispatchedAt = now
 	task.PhaseIdx = c.phaseIdx
 	c.inFlight[task.TaskId] = task
 
-	reply.MsgType = TaskAlloc
-	reply.TaskID = task.TaskId
-	reply.TaskName = task.FilePath
-	reply.FileName = task.FileName
-	reply.ChunkID = task.ChunkID
-	reply.BucketID = task.TaskId
-	reply.NReduce = c.NReduce
-	reply.ActionIndex = c.phaseIdx
-	reply.PhaseIdx = c.phaseIdx
-	reply.ChunkOffset = task.ChunkOffset
+	action := c.ProcessAction[c.phaseIdx]
+	reply.MsgType        = TaskAlloc
+	reply.TaskID         = task.TaskId
+	reply.TaskName       = task.FilePath
+	reply.FileName       = task.FileName
+	reply.ChunkID        = task.ChunkID
+	reply.BucketID       = task.TaskId
+	reply.NReduce        = c.NReduce
+	reply.ActionIndex    = c.phaseIdx
+	reply.PhaseIdx       = c.phaseIdx
+	reply.ChunkOffset    = task.ChunkOffset
+	reply.PluginName     = action.Name
+	reply.StageIdx       = c.phaseIdx
+	reply.InputStageIdx  = c.phaseIdx - 1
+	reply.ActionType     = action.ActionType
+	reply.DispatchedAt   = now.UnixNano()
+	c.mu.Unlock()
 	return nil
 }
 
 // NoticeResult implements TaskScheduler.
 func (c *Coordinator) NoticeResult(req *MessageSend, reply *MessageReply) error {
+	// Read shared state under lock, then release before proposing to Raft.
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Ignore reports from a stale phase (coordinator already moved on).
 	if req.PhaseIdx != c.phaseIdx {
+		c.mu.Unlock()
 		fmt.Printf("[coordinator] stale report for phase %d (current %d), ignoring\n",
 			req.PhaseIdx, c.phaseIdx)
 		return nil
 	}
-
 	task, inflight := c.inFlight[req.TaskID]
+	var chunkID string
 	if inflight {
+		// Reject reports from a worker that was superseded by a sweeper re-dispatch.
+		// The worker echoes back the DispatchedAt token we gave it; if it doesn't
+		// match the current record, this is a late report from the old worker.
+		if req.DispatchedAt != 0 && task.DispatchedAt.UnixNano() != req.DispatchedAt {
+			c.mu.Unlock()
+			fmt.Printf("[coordinator] stale report for task %d (dispatch token mismatch), ignoring\n", req.TaskID)
+			return nil
+		}
+		chunkID = task.ChunkID
+		// Evict from inFlight immediately under the same lock.
+		// This closes the race where the sweeper could observe the task as
+		// still dispatched and re-enqueue it between now and when FSM.Apply
+		// runs inside proposeCmd.  FSM.Apply's delete is a safe no-op.
 		delete(c.inFlight, req.TaskID)
 	}
+	c.mu.Unlock()
 
-	switch req.MsgType {
-	case TaskSuccess:
-		c.phaseDone++
-		if inflight && task.ChunkID != "" {
-			delete(c.chunkStore, task.ChunkID)
-		}
-		fmt.Printf("[coordinator] phase %d: task %d succeeded (%d/%d done)\n",
-			req.PhaseIdx, req.TaskID, c.phaseDone, c.phaseTotal())
-
-	case TaskContinue:
+	// TaskContinue re-enqueues locally (offset advance, no phase-level counter change).
+	if req.MsgType == TaskContinue {
 		if !inflight {
 			return nil
 		}
+		c.mu.Lock()
 		task.ChunkOffset = req.NextOffset
 		task.Status = UnAssigned
 		task.DispatchedAt = time.Time{}
 		c.JobStatus.Enqueue(task)
+		c.mu.Unlock()
 		fmt.Printf("[coordinator] phase %d: task %d continuing at offset %d\n",
 			req.PhaseIdx, req.TaskID, req.NextOffset)
+		return nil
+	}
+
+	// TaskSuccess and TaskFailed mutate phaseDone/retries — propose through Raft.
+	switch req.MsgType {
+	case TaskSuccess:
+		if err := c.proposeCmd(RaftCommand{
+			Type:     CmdCompleteTask,
+			TaskID:   req.TaskID,
+			ChunkID:  chunkID,
+			PhaseIdx: req.PhaseIdx,
+		}); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		fmt.Printf("[coordinator] phase %d: task %d succeeded (%d/%d done)\n",
+			req.PhaseIdx, req.TaskID, c.phaseDone, c.phaseTotal())
+		c.mu.Unlock()
 
 	case TaskFailed:
 		if !inflight {
-			// No in-flight record — duplicate or phantom report; ignore.
 			return nil
 		}
-		task.Retries++
-		if task.Retries >= maxRetries {
-			c.failedTasks++
-			if task.ChunkID != "" {
-				delete(c.chunkStore, task.ChunkID)
-			}
-			fmt.Printf("[coordinator] phase %d: task %d exhausted %d retries — giving up\n",
-				req.PhaseIdx, req.TaskID, maxRetries)
-			// Count as done so the phase can still complete (with partial results).
-			c.phaseDone++
-		} else {
-			task.Status = UnAssigned
-			task.DispatchedAt = time.Time{}
-			c.JobStatus.Enqueue(task)
-			fmt.Printf("[coordinator] phase %d: task %d failed (retry %d/%d), re-enqueued\n",
-				req.PhaseIdx, req.TaskID, task.Retries, maxRetries)
+		if err := c.proposeCmd(RaftCommand{
+			Type:     CmdFailTask,
+			TaskID:   req.TaskID,
+			PhaseIdx: req.PhaseIdx,
+		}); err != nil {
+			return err
 		}
 	}
 
+	return nil
+}
+
+// SubmitJob accepts a JobSpec from a remote client, wires up the data source,
+// and starts streaming chunks into the coordinator so workers can pick them up.
+// In distributed mode only the Raft leader can accept new jobs.
+func (c *Coordinator) SubmitJob(spec *JobSpec, reply *JobReply) error {
+	if c.raftNode != nil && c.raftNode.State() != raft.Leader {
+		leaderAddr, _ := c.raftNode.LeaderWithID()
+		rpcAddr := c.peerRPCAddrs[leaderAddr]
+		reply.Error = fmt.Sprintf("not leader; redirect to %s (rpc: %s)", leaderAddr, rpcAddr)
+		return nil
+	}
+
+	if len(spec.Stages) == 0 {
+		reply.Error = "job has no stages"
+		return nil
+	}
+
+	// Convert StageSpecs to StreamProcessActions.
+	actions := make([]StreamProcessAction, len(spec.Stages))
+	for i, s := range spec.Stages {
+		actions[i] = StreamProcessAction{Name: s.PluginName, ActionType: s.Type}
+	}
+
+	src, err := datasource.NewFromConfig(spec.Source.Type, spec.Source.Config)
+	if err != nil {
+		reply.Error = err.Error()
+		return nil
+	}
+
+	c.mu.Lock()
+	c.ProcessAction = actions
+	if spec.NReduce > 0 {
+		c.NReduce = spec.NReduce
+	}
+	c.mu.Unlock()
+
+	ctx := context.Background()
+	q := src.StreamChunks(ctx)
+	go c.listenFromDataSource(q)
+
+	reply.JobID = spec.JobID
+	reply.Status = "accepted"
+	return nil
+}
+
+// IsDone lets a remote client poll for job completion.
+func (c *Coordinator) IsDone(req *JobSpec, reply *JobReply) error {
+	reply.JobID = req.JobID
+	if c.Done() {
+		reply.Status = "done"
+	} else {
+		reply.Status = "running"
+	}
 	return nil
 }
 
@@ -247,42 +410,90 @@ func (c *Coordinator) sweepTimedOutTasks() {
 	}
 }
 
-// phaseTotal returns the expected number of completions for the current phase.
+// phaseTotal returns the expected number of task completions for the current phase.
 func (c *Coordinator) phaseTotal() int {
-	return c.NumTasks
+	if c.phaseIdx >= len(c.ProcessAction) {
+		return 0
+	}
+	switch c.ProcessAction[c.phaseIdx].ActionType {
+	case ReduceTask, GroupByTask, SelectKeyTask, SinkTask:
+		return c.NReduce
+	default:
+		return c.NumTasks
+	}
 }
 
 // transitionToNextPhase advances phaseIdx and enqueues tasks for the new phase.
+// MUST be called without holding c.mu — proposeCmd acquires it internally.
+// Task count and shape depend on the incoming stage type:
+//   - Map, Filter:            one task per input chunk (chunk-parallel)
+//   - Reduce, GroupBy, SelectKey, Sink: one task per NReduce bucket (bucket-parallel)
 func (c *Coordinator) transitionToNextPhase() {
-	c.phaseIdx++
-	c.phaseDone = 0
-	c.failedTasks = 0
-	c.inFlight = make(map[int]*TaskInfo)
-
-	if c.done() {
-		fmt.Println("[coordinator] all phases complete")
+	// Propose phase advancement (increments phaseIdx, resets counters on all nodes).
+	if err := c.proposeCmd(RaftCommand{Type: CmdAdvancePhase}); err != nil {
+		fmt.Printf("[coordinator] transitionToNextPhase: proposeCmd: %v\n", err)
 		return
 	}
 
+	c.mu.Lock()
+	if c.done() {
+		c.mu.Unlock()
+		fmt.Println("[coordinator] all phases complete")
+		return
+	}
 	action := c.ProcessAction[c.phaseIdx]
-	fmt.Printf("[coordinator] transitioning to phase %d (%v)\n", c.phaseIdx, action.ActionType)
+	numTasks := c.NumTasks
+	nReduce := c.NReduce
+	// Copy the maps we need before releasing the lock.
+	taskFiles := make(map[int]string, numTasks)
+	taskFileNames := make(map[int]string, numTasks)
+	for k, v := range c.taskFiles { taskFiles[k] = v }
+	for k, v := range c.taskFileNames { taskFileNames[k] = v }
+	c.mu.Unlock()
+
+	fmt.Printf("[coordinator] transitioning to phase %d (%v plugin=%s)\n",
+		c.phaseIdx, action.ActionType, action.Name)
 
 	switch action.ActionType {
-	case MapTask:
-		// tasks arrive dynamically from the data source — nothing to enqueue here
-	default:
-		// One reduce task per map task: workers glob mr-{ChunkID}-* to find all map outputs.
-		for i := 0; i < c.NumTasks; i++ {
-			chunkID := c.taskFiles[i]
-			c.JobStatus.Enqueue(&TaskInfo{
-				TaskId:   i,
-				FilePath: chunkID,
-				FileName: c.taskFileNames[i],
-				ChunkID:  chunkID,
-				Status:   UnAssigned,
-				PhaseIdx: c.phaseIdx,
-			})
+	case MapTask, FilterTask:
+		if c.phaseIdx == 0 {
+			return // phase 0 tasks arrive dynamically from listenFromDataSource
 		}
+		for i := 0; i < numTasks; i++ {
+			chunkID := taskFiles[i]
+			_ = c.proposeCmd(RaftCommand{Type: CmdEnqueueTask, Task: &TaskInfo{
+				TaskId:     i,
+				FilePath:   chunkID,
+				FileName:   taskFileNames[i],
+				ChunkID:    chunkID,
+				Status:     UnAssigned,
+				PhaseIdx:   c.phaseIdx,
+				StageIdx:   c.phaseIdx,
+				PluginName: action.Name,
+			}})
+		}
+
+	case ReduceTask, GroupByTask, SelectKeyTask:
+		for bucket := 0; bucket < nReduce; bucket++ {
+			_ = c.proposeCmd(RaftCommand{Type: CmdEnqueueTask, Task: &TaskInfo{
+				TaskId:     bucket,
+				FilePath:   fmt.Sprintf("bucket-%d", bucket),
+				Status:     UnAssigned,
+				PhaseIdx:   c.phaseIdx,
+				StageIdx:   c.phaseIdx,
+				PluginName: action.Name,
+			}})
+		}
+
+	case SinkTask:
+		_ = c.proposeCmd(RaftCommand{Type: CmdEnqueueTask, Task: &TaskInfo{
+			TaskId:     0,
+			FilePath:   "sink",
+			Status:     UnAssigned,
+			PhaseIdx:   c.phaseIdx,
+			StageIdx:   c.phaseIdx,
+			PluginName: action.Name,
+		}})
 	}
 }
 
@@ -291,12 +502,15 @@ func (c *Coordinator) transitionToNextPhase() {
 func (c *Coordinator) currentPhaseComplete() bool {
 	allReported := c.phaseDone == c.phaseTotal()
 	noneInFlight := len(c.inFlight) == 0
-	switch c.ProcessAction[c.phaseIdx].ActionType {
-	case MapTask:
-		return c.sourceDone && allReported && noneInFlight
-	default:
-		return allReported && noneInFlight
+	if c.phaseIdx >= len(c.ProcessAction) {
+		return true
 	}
+	// The first Map phase depends on the source being exhausted first.
+	// Subsequent chunk-parallel phases (Map/Filter at phaseIdx>0) do not.
+	if c.ProcessAction[c.phaseIdx].ActionType == MapTask && c.phaseIdx == 0 {
+		return c.sourceDone && allReported && noneInFlight
+	}
+	return allReported && noneInFlight
 }
 
 func (c *Coordinator) done() bool {
@@ -317,6 +531,49 @@ func (c *Coordinator) nextJob() (*TaskInfo, bool) {
 	return item.(*TaskInfo), false
 }
 
+// StartWithRaft is the entry point for the unified node model.
+// It registers RPCs, opens a TCP listener, then watches Raft leadership changes:
+//   - On becoming leader: activates the coordinator role (task scheduler).
+//   - On becoming follower: starts a worker loop polling the leader's RPC address.
+//
+// peerRPCAddrs maps each peer's Raft transport address to its worker RPC address
+// (e.g. "node-0:7000" → "node-0:8000") so followers can find the current leader.
+func (c *Coordinator) StartWithRaft(myRPCAddr string, peerRPCAddrs map[raft.ServerAddress]string, registry *PluginRegistry, outputDir string) {
+	c.myRPCAddr = myRPCAddr
+	c.peerRPCAddrs = peerRPCAddrs
+	c.workerRegistry = registry
+	c.workerOutputDir = outputDir
+
+	rpc.Register(c)
+	rpc.HandleHTTP()
+	if err := c.ListenTCP(myRPCAddr); err != nil {
+		log.Fatal(err)
+	}
+	go c.runSweeper()
+	go c.watchLeadership()
+}
+
+// watchLeadership reacts to Raft leadership changes, activating coordinator or
+// worker role on this node accordingly.
+func (c *Coordinator) watchLeadership() {
+	for isLeader := range c.raftNode.LeaderCh() {
+		if isLeader {
+			fmt.Printf("[node] became leader — coordinator role active (rpc=%s)\n", c.myRPCAddr)
+			// The coordinator is always registered; it starts serving tasks as soon as
+			// SubmitJob is called.  No extra activation needed beyond logging.
+		} else {
+			leaderRaftAddr := c.raftNode.Leader()
+			leaderRPCAddr := c.peerRPCAddrs[leaderRaftAddr]
+			if leaderRPCAddr == "" {
+				fmt.Printf("[node] became follower (leader raft=%s, rpc unknown — waiting)\n", leaderRaftAddr)
+				continue
+			}
+			fmt.Printf("[node] became follower — starting worker (leader rpc=%s)\n", leaderRPCAddr)
+			go StartWorkerRemote(os.Getpid(), c.workerRegistry, c.workerOutputDir, leaderRPCAddr)
+		}
+	}
+}
+
 func (c *Coordinator) Start(q *datasource.ChunkQueue) {
 	rpc.Register(c)
 	rpc.HandleHTTP()
@@ -330,6 +587,18 @@ func (c *Coordinator) Start(q *datasource.ChunkQueue) {
 	go c.listenFromDataSource(q)
 	go c.runSweeper()
 	time.Sleep(30 * time.Millisecond)
+}
+
+// ListenTCP opens an additional TCP listener so remote clients (go-flink submit)
+// can reach the coordinator's RPCs at addr (host:port).
+func (c *Coordinator) ListenTCP(addr string) error {
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("coordinator TCP listen on %s: %w", addr, err)
+	}
+	go http.Serve(l, nil)
+	fmt.Printf("[coordinator] accepting remote RPC connections on %s\n", addr)
+	return nil
 }
 
 // runSweeper periodically re-enqueues tasks whose workers have gone silent.
@@ -347,6 +616,14 @@ func (c *Coordinator) runSweeper() {
 func (c *Coordinator) listenFromDataSource(q *datasource.ChunkQueue) {
 	fmt.Println("[coordinator] listening from data source")
 	idx := 0
+
+	c.mu.Lock()
+	phase0Plugin := ""
+	if len(c.ProcessAction) > 0 {
+		phase0Plugin = c.ProcessAction[0].Name
+	}
+	c.mu.Unlock()
+
 	for !q.Done() {
 		chunk, ok := q.Pop()
 		if !ok {
@@ -354,24 +631,29 @@ func (c *Coordinator) listenFromDataSource(q *datasource.ChunkQueue) {
 			continue
 		}
 		chunkID := uuid.New().String()
+
+		// Store raw bytes locally (too large for Raft log; workers fetch via GetChunk RPC).
 		c.mu.Lock()
 		c.chunkStore[chunkID] = chunk.Content
-		c.JobStatus.Enqueue(&TaskInfo{
-			FilePath: chunkID,
-			FileName: chunk.FileName,
-			ChunkID:  chunkID,
-			Status:   UnAssigned,
-			TaskId:   idx,
-			PhaseIdx: 0,
-		})
-		c.taskFiles[idx] = chunkID
-		c.taskFileNames[idx] = chunk.FileName
-		idx++
-		c.NumTasks++
 		c.mu.Unlock()
+
+		// Propose the task enqueue through Raft (no lock held).
+		_ = c.proposeCmd(RaftCommand{Type: CmdEnqueueTask, Task: &TaskInfo{
+			FilePath:   chunkID,
+			FileName:   chunk.FileName,
+			ChunkID:    chunkID,
+			Status:     UnAssigned,
+			TaskId:     idx,
+			PhaseIdx:   0,
+			StageIdx:   0,
+			PluginName: phase0Plugin,
+		}})
+
 		fmt.Printf("[coordinator] enqueued map task %d: file=%s chunk=%s (%d bytes)\n",
-			idx-1, chunk.FileName, chunkID, len(chunk.Content))
+			idx, chunk.FileName, chunkID, len(chunk.Content))
+		idx++
 	}
+
 	c.mu.Lock()
 	c.sourceDone = true
 	c.mu.Unlock()

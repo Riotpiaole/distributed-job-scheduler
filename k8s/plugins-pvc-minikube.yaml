@@ -1,0 +1,13 @@
+## Minikube variant of plugins-pvc.yaml.
+## Minikube's default provisioner only supports ReadWriteOnce.
+## That's fine for a single-node cluster — all pods share the same node anyway.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: go-flink-plugins
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 500Mi

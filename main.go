@@ -118,10 +118,12 @@ func main() {
 	// node subcommand: unified node that becomes coordinator (leader) or worker (follower) via Raft
 	var nodeID string
 	var raftBind string
+	var raftAdvertise string
 	var rpcBind string
 	var raftPeers string
 	var nodePluginDir string
 	var nodeDataDir string
+	var nodeKafkaBrokers string
 
 	nodeCmd := &cobra.Command{
 		Use:   "node",
@@ -154,7 +156,7 @@ func main() {
 
 			registry := pipeline.NewPluginRegistry(nodePluginDir)
 			coord := pipeline.NewCoordinator(4, nil)
-			if err := coord.InitRaft(nodeID, raftBind, raftPeerList, nodeDataDir); err != nil {
+			if err := coord.InitRaft(nodeID, raftBind, raftAdvertise, raftPeerList, nodeDataDir); err != nil {
 				return err
 			}
 			coord.StartWithRaft(rpcBind, peerRPCAddrs, registry, outputDir)
@@ -164,12 +166,14 @@ func main() {
 		},
 	}
 	nodeCmd.Flags().StringVar(&nodeID, "node-id", "", "unique node identifier (default: hostname)")
-	nodeCmd.Flags().StringVar(&raftBind, "raft-bind", ":7000", "host:port for Raft transport")
+	nodeCmd.Flags().StringVar(&raftBind, "raft-bind", ":7000", "host:port to listen on for Raft transport")
+	nodeCmd.Flags().StringVar(&raftAdvertise, "raft-advertise", "", "host:port advertised to Raft peers (default: same as --raft-bind)")
 	nodeCmd.Flags().StringVar(&rpcBind, "bind", ":8000", "host:port for worker/submit RPC")
 	nodeCmd.Flags().StringVar(&raftPeers, "raft-peers", "",
 		"comma-separated raftAddr=rpcAddr pairs for all cluster members (e.g. node-0:7000=node-0:8000,...)")
 	nodeCmd.Flags().StringVar(&nodePluginDir, "plugin-dir", "./plugins", "directory containing .so plugins")
 	nodeCmd.Flags().StringVar(&nodeDataDir, "data-dir", "./raft-data", "directory for Raft WAL and snapshots")
+	nodeCmd.Flags().StringVar(&nodeKafkaBrokers, "kafka-brokers", "", "comma-separated Kafka broker addresses (reserved for Kafka task queue, not yet active)")
 
 	rootCmd.AddCommand(runCmd, workerCmd, submitCmd, nodeCmd)
 	rootCmd.PersistentFlags().StringVarP(&outputDir, "output", "o", defaultOutputDir(),

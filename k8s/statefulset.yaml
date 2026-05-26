@@ -25,7 +25,8 @@ spec:
         - /usr/local/bin/go-flink
         - node
         - --node-id=$(POD_NAME)
-        - --raft-bind=$(POD_NAME).go-flink:7000
+        - --raft-bind=:7000
+        - --raft-advertise=$(POD_NAME).go-flink:7000
         - --raft-peers=go-flink-0.go-flink:7000=go-flink-0.go-flink:8000,go-flink-1.go-flink:7000=go-flink-1.go-flink:8000,go-flink-2.go-flink:7000=go-flink-2.go-flink:8000
         - --bind=:8000
         - --data-dir=/data/raft
@@ -43,6 +44,13 @@ spec:
         volumeMounts:
         - name: raft-data
           mountPath: /data/raft
+        - name: input
+          mountPath: /data/input
+      volumes:
+      - name: input
+        hostPath:
+          path: /mnt/datasets
+          type: DirectoryOrCreate
   volumeClaimTemplates:
   - metadata:
       name: raft-data

@@ -133,14 +133,41 @@ func (c *Coordinator) proposeCmd(cmd RaftCommand) error {
 }
 
 // InitRaft bootstraps a Raft cluster for this coordinator node.
-// nodeID is a unique string (e.g. "node-0"), raftBind is "host:port" for Raft
-// transport, peers is the full list of peer raftBind addresses (including self),
-// and dataDir is the directory for Raft WAL and snapshots.
-func (c *Coordinator) InitRaft(nodeID, raftBind string, peers []string, dataDir string) error {
+// nodeID is a unique string (e.g. "node-0"), raftBind is the TCP listen address
+// (e.g. ":7000"), raftAdvertise is the address peers use to reach this node
+// (e.g. "go-flink-0.go-flink:7000"; empty = same as raftBind), peers is the
+// full list of advertised addresses for all cluster members, and dataDir is the
+// directory for Raft WAL and snapshots.
+func (c *Coordinator) InitRaft(nodeID, raftBind, raftAdvertise string, peers []string, dataDir string) error {
 	cfg := raft.DefaultConfig()
-	cfg.LocalID = raft.ServerID(nodeID)
+	// Use raftAdvertise as the Raft server ID so it matches the peer list entries.
+	// Falls back to nodeID when running single-node without an advertise address.
+	localID := raftAdvertise
+	if localID == "" {
+		localID = nodeID
+	}
+	cfg.LocalID = raft.ServerID(localID)
 
-	transport, err := raft.NewTCPTransport(raftBind, nil, 3, 10*time.Second, os.Stderr)
+	var advertise net.Addr
+	if raftAdvertise != "" {
+		// Pod DNS entries may not propagate immediately — retry for up to 60 s.
+		var tcpAddr *net.TCPAddr
+		var err error
+		for i := 0; i < 30; i++ {
+			tcpAddr, err = net.ResolveTCPAddr("tcp", raftAdvertise)
+			if err == nil {
+				break
+			}
+			log.Printf("[raft] waiting for DNS %s (%d/30): %v", raftAdvertise, i+1, err)
+			time.Sleep(2 * time.Second)
+		}
+		if err != nil {
+			return fmt.Errorf("raft advertise addr %s: %w", raftAdvertise, err)
+		}
+		advertise = tcpAddr
+	}
+
+	transport, err := raft.NewTCPTransport(raftBind, advertise, 3, 10*time.Second, os.Stderr)
 	if err != nil {
 		return fmt.Errorf("raft transport: %w", err)
 	}
@@ -182,6 +209,13 @@ func (c *Coordinator) InitRaft(nodeID, raftBind string, peers []string, dataDir 
 func (c *Coordinator) AskForTask(req *MessageSend, reply *MessageReply) error {
 	if req.MsgType != AskForTask {
 		return fmt.Errorf("bad message type")
+	}
+
+	// Followers don't hold the full job state — tell external workers to wait
+	// and retry; they will eventually land on the leader via the load-balancer.
+	if c.raftNode != nil && c.raftNode.State() != raft.Leader {
+		reply.MsgType = Wait
+		return nil
 	}
 
 	c.mu.Lock()
@@ -514,6 +548,10 @@ func (c *Coordinator) currentPhaseComplete() bool {
 }
 
 func (c *Coordinator) done() bool {
+	// No job submitted yet — ProcessAction is empty.
+	if len(c.ProcessAction) == 0 {
+		return false
+	}
 	return c.phaseIdx >= len(c.ProcessAction)
 }
 

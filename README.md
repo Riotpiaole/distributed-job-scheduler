@@ -1,141 +1,114 @@
 # go-flink
 
-A distributed MapReduce pipeline engine written in Go. 
+A distributed MapReduce pipeline engine written in Go. Processing stages run as `.so` plugins; the cluster uses Raft for leader election and fault-tolerant task scheduling.
 
-## How it works
+## Modes
 
-The coordinator reads input files, splits them into 10 MB chunks, and distributes map and reduce tasks to workers over a Unix-domain RPC socket. Workers are independent processes — you can start one or a hundred on the same machine. Each loads the same plugin and registers with the coordinator automatically.
+| Mode | Command | Use case |
+|---|---|---|
+| Single-node (embedded) | `go-flink run` | Local testing — coordinator + workers in one process |
+| Distributed cluster | `go-flink node` | Multi-node Kubernetes deployment via Raft |
+| Remote submission | `go-flink submit` | Send a job to a running cluster |
+| Worker-only | `go-flink worker` | Attach additional workers to an existing coordinator |
 
-## Quick start
+---
 
-### 1. Build the coordinator/worker binary
+## Quick start — single node
+
+### 1. Build
 
 ```bash
 go build -o go-flink .
+
+# Build the bundled word-count plugin
+CGO_ENABLED=1 go build -buildmode=plugin -o plugins/wc.so ./plugin/
 ```
 
-### 2. Build a plugin
+### 2. Run word count
 
 ```bash
-cd plugin
-go build -buildmode=plugin -o wc.so wc.go
+./go-flink run --plugin wc --dir ./datasets --n-reduce 4
 ```
 
-### 3. Start the coordinator
+This starts an embedded coordinator, reads all files from `./datasets`, and spins up workers in-process. Results land in `./mr-out/`.
+
+### 3. Add workers for more parallelism
+
+In separate terminals (or processes):
 
 ```bash
-./go-flink <input-dir> wc.so -o mr-out
+./go-flink worker --plugin-dir ./plugins
+./go-flink worker --plugin-dir ./plugins
+./go-flink worker --plugin-dir ./plugins
 ```
 
-### 4. Start workers (in separate terminals or processes)
+Workers register automatically by polling the coordinator's Unix socket. Add or remove them at any time while the job runs.
+
+---
+
+## Distributed cluster
+
+Every node runs the same binary. Raft elects one leader (coordinator); others act as workers.
 
 ```bash
-# Each worker process picks up its own PID as --id by default
-./go-flink worker --plugin wc.so
-./go-flink worker --plugin wc.so
-./go-flink worker --plugin wc.so
+# Node 0
+./go-flink node \
+  --node-id node-0 \
+  --raft-bind :7000 \
+  --raft-advertise node-0.go-flink:7000 \
+  --raft-peers "node-0.go-flink:7000=node-0.go-flink:8000,node-1.go-flink:7000=node-1.go-flink:8000,node-2.go-flink:7000=node-2.go-flink:8000" \
+  --bind :8000 \
+  --plugin-dir /plugins \
+  --data-dir /data/raft
+
+# Node 1, Node 2 — same flags, different --node-id and addresses
 ```
 
-Spin up as many workers as you need. The coordinator hands out tasks as fast as workers ask for them. When all tasks are done the coordinator sends a shutdown signal and all workers exit cleanly.
+Submit a job once the cluster is up:
 
-## Scaling
-
-Throughput scales with the number of worker processes. Workers are stateless — they fetch chunk content from the coordinator via RPC (`GetChunk`), run the plugin's `Map` or `Reduce` function locally, and write intermediate files to the shared output directory. To scale:
-
-- Add more `./go-flink worker --plugin <your>.so` processes.
-- Point them all at the same output directory (`-o`).
-- No other configuration is needed.
-
-There is no upper limit enforced by the framework. The coordinator's priority queue and timeout sweeper handle stragglers and crashed workers automatically (up to 3 retries per task).
-
-## Why ChunkQueue instead of a channel
-
-The datasource originally streamed chunks over a Go channel. This caused a deadlock: the coordinator's `listenFromDataSource` goroutine would block on a channel receive waiting for the next chunk, while simultaneously needing to serve incoming `AskForTask` and `GetChunk` RPC calls from workers. Because the RPC server and the chunk listener shared the same goroutine scheduling path, the coordinator could not concurrently pull messages from the channel and respond to workers — one side always starved the other.
-
-`ChunkQueue` solves this by decoupling production from consumption. The datasource goroutine pushes chunks into the queue without blocking the coordinator. The coordinator's listener goroutine polls with a short sleep when the queue is empty, leaving the RPC server free to handle worker requests at all times. The queue is closed by the producer when all chunks have been pushed; consumers check `Done()` to know when to stop polling.
-
-## Coordinator ↔ Worker call sequence
-
-### Map phase
-
-```
-Worker                                      Coordinator
-  │                                              │
-  │  ── AskForTask(MsgType=AskForTask) ────────► │
-  │                                              │  dequeue next TaskInfo from priority queue
-  │                                              │  mark task in-flight (DispatchedAt = now)
-  │ ◄─ TaskAlloc(ChunkID, ActionIndex=0, ──────  │
-  │              PhaseIdx, NReduce)              │
-  │                                              │
-  │  ── GetChunk(ChunkID) ─────────────────────► │
-  │ ◄─ ChunkReply(Content []byte) ─────────────  │  raw bytes served from chunkStore
-  │                                              │
-  │  [run plugin.Map(filename, content)]         │
-  │  [write mr-<chunkID>-<bucket> to disk]       │
-  │                                              │
-  │  ── NoticeResult(TaskSuccess, TaskID, ─────► │
-  │                  PhaseIdx)                   │  phaseDone++; delete chunk from chunkStore
-  │                                              │  if all map tasks done → transitionToNextPhase()
+```bash
+./go-flink submit \
+  --cluster node-0.go-flink:8000 \
+  --plugin wc \
+  --dir /data/input \
+  --n-reduce 4
 ```
 
-### Reduce phase
+---
 
-```
-Worker                                      Coordinator
-  │                                              │
-  │  ── AskForTask(MsgType=AskForTask) ────────► │
-  │                                              │  dequeue reduce TaskInfo (one per ChunkID)
-  │ ◄─ TaskAlloc(TaskName=ChunkID, ────────────  │
-  │              ActionIndex=1, PhaseIdx)        │
-  │                                              │
-  │  [glob mr-<ChunkID>-* from disk]             │
-  │  [sort + group by key]                       │
-  │  [run plugin.Reduce(key, values)]            │
-  │  [write mr-out-<ChunkID> to disk]            │
-  │                                              │
-  │  ── NoticeResult(TaskSuccess, TaskID, ─────► │
-  │                  PhaseIdx)                   │  phaseDone++
-  │                                              │  if all reduce tasks done → Done() = true
-```
+## Kubernetes (minikube)
 
-### Task failure and retry
+```bash
+# Mount local datasets into minikube
+minikube mount ./datasets:/mnt/datasets &
 
-```
-Worker                                      Coordinator
-  │                                              │
-  │  [task fails mid-execution]                  │
-  │  ── NoticeResult(TaskFailed, TaskID, ──────► │
-  │                  PhaseIdx)                   │  task.Retries++
-  │                                              │  if Retries < 3 → re-enqueue task
-  │                                              │  if Retries >= 3 → give up, phaseDone++
+# Build image into minikube's daemon
+eval $(minikube docker-env)
+docker build -t goflink:v1.0.0 .
+
+# Deploy
+kubectl apply -f k8s/output-pvc-minikube.yaml \
+              -f k8s/plugins-pvc-minikube.yaml \
+              -f k8s/headless-service.yaml \
+              -f k8s/rpc-service.yaml \
+              -f k8s/statefulset.yaml \
+              -f k8s/worker-deployment.yaml
+
+# Wait for cluster to elect a leader
+kubectl rollout status statefulset/go-flink
+
+# Submit a job
+kubectl port-forward svc/go-flink-rpc 8000:8000 &
+./go-flink submit --cluster localhost:8000 --plugin wc --dir /data/input --n-reduce 4
 ```
 
-### Worker stall / crash (sweeper path)
+See [k8s/](k8s/) for manifest details.
 
-```
-Worker                                      Coordinator (sweeper goroutine, every 5s)
-  │                                              │
-  │  [worker process hangs or dies]              │
-  │  [no NoticeResult arrives]                   │
-  │                                              │  now - task.DispatchedAt > 30s
-  │                                              │  task.Retries++
-  │                                              │  re-enqueue task (or give up after 3 retries)
-```
-
-### Shutdown
-
-```
-Worker                                      Coordinator
-  │                                              │
-  │  ── AskForTask ────────────────────────────► │  Done() == true
-  │ ◄─ Shutdown ───────────────────────────────  │
-  │                                              │
-  │  [worker exits]                              │
-```
+---
 
 ## Writing a plugin
 
-A plugin is a regular Go file compiled with `-buildmode=plugin`. It must export exactly two functions:
+A plugin is a Go file compiled with `-buildmode=plugin`. Export exactly:
 
 ```go
 func Map(filename string, contents string) []pipeline.KeyValue
@@ -144,29 +117,87 @@ func Reduce(key string, values []string) string
 
 See [plugin/wc.go](plugin/wc.go) for a complete word-count example.
 
-Build it:
 ```bash
-go build -buildmode=plugin -o myplugin.so myplugin.go
+CGO_ENABLED=1 go build -buildmode=plugin -o plugins/myplugin.so myplugin.go
 ```
+
+Plugins are loaded on first use via `PluginRegistry.Get(name)` — drop a new `.so` into the plugin directory and the next task that names it will load it automatically. No restart needed.
+
+---
+
+## Pipeline builder
+
+```go
+ds := datasource.FilesDataSource{FilePath: "./datasets"}
+pipeline.NewPipeline(&ds).
+    Map("tokenizer").
+    Map("normalizer").
+    Reduce("word_count").
+    Sink("file_sink").
+    Start()           // embedded single-node
+    // or .Submit("coordinator:8000") for cluster
+```
+
+Each stage names a plugin. Stages chain through intermediate files automatically.
+
+---
 
 ## CLI reference
 
 ```
-go-flink <input-dir> <plugin.so> [-o output-dir]
-    Start the coordinator and begin streaming input files.
+go-flink run
+    --plugin <name>        plugin stem (e.g. "wc" for plugins/wc.so)  [required]
+    --dir <path>           input directory                              [default: ./datasets]
+    --n-reduce <int>       reduce partitions                           [default: 4]
+    --plugin-dir <dir>     .so plugin directory                        [default: ./plugins]
+    --sink                 append MongoDB sink stage
+    --listen <addr>        expose SubmitJob RPC for remote submissions
+    -o <dir>               output directory                            [default: ./mr-out]
 
-go-flink worker --plugin <plugin.so> [--id <int>] [-o output-dir]
-    Start a worker process. --id defaults to the process PID.
-    Run this command in parallel across as many processes as desired.
+go-flink worker
+    --plugin-dir <dir>     .so plugin directory                        [default: ./plugins]
+    --coordinator <addr>   coordinator host:port (empty = Unix socket)
+    --id <int>             worker ID                                   [default: PID]
+    -o <dir>               output directory
+
+go-flink node
+    --node-id <string>     unique identifier                           [default: hostname]
+    --raft-bind <addr>     TCP listen address for Raft transport       [default: :7000]
+    --raft-advertise <addr> address peers use to reach this node
+    --raft-peers <list>    comma-separated raftAddr=rpcAddr pairs
+    --bind <addr>          TCP listen address for worker/submit RPC    [default: :8000]
+    --data-dir <dir>       Raft WAL + snapshot directory               [default: ./raft-data]
+    --plugin-dir <dir>     .so plugin directory                        [default: ./plugins]
+    -o <dir>               output directory
+
+go-flink submit
+    --cluster <addr>       coordinator host:port                       [required]
+    --plugin <name>        plugin stem                                  [required]
+    --dir <path>           input directory
+    --source-type <type>   file | s3 | kafka                           [default: file]
+    --n-reduce <int>       reduce partitions                           [default: 4]
+    --sink                 append MongoDB sink stage
+    -o <dir>               output directory
 ```
 
-## Output
+---
 
-Intermediate files are written as `mr-<chunkID>-<bucket>` and final results as `mr-out-<chunkID>` inside the output directory (default: `mr-out/`).
+## Intermediate file naming
+
+| Stage type | Pattern written | Pattern read by next stage |
+|---|---|---|
+| Map / Filter | `mr-s<N>-<chunkID>-<bucket>` | next Map/Filter reads `mr-s<N>-<chunkID>-*` |
+| Reduce / GroupBy | `mr-out-s<N>-<bucket>` | Sink reads `mr-out-s<N>-*` |
+
+The stage index `N` is embedded in filenames so multi-stage pipelines never collide.
+
+---
 
 ## Dependencies
 
-- [cobra](https://github.com/spf13/cobra) — CLI
-- [gods](https://github.com/emirpasic/gods) — priority queue for task scheduling
-- [hashring](https://github.com/serialx/hashring) — consistent hashing for reduce partitioning
-- [uuid](https://github.com/google/uuid) — chunk identity
+- [hashicorp/raft](https://github.com/hashicorp/raft) — Raft consensus for leader election and log replication
+- [spf13/cobra](https://github.com/spf13/cobra) — CLI
+- [emirpasic/gods](https://github.com/emirpasic/gods) — priority queue for task scheduling
+- [serialx/hashring](https://github.com/serialx/hashring) — consistent hashing for reduce bucket assignment
+- [google/uuid](https://github.com/google/uuid) — chunk identity
+- [go.mongodb.org/mongo-driver/v2](https://pkg.go.dev/go.mongodb.org/mongo-driver/v2) — MongoDB sink
